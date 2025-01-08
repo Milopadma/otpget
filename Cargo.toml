@@ -1,6 +1,6 @@
 [package]
 name = "otpget"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A command-line tool for automatically retrieving OTP codes from email messages"
 license = "MIT"
