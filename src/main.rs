@@ -7,29 +7,27 @@ use mail_parser::Message;
 use regex::Regex;
 use clap::Parser;
 use imap::Session;
+use chrono::{Utc, Duration as ChronoDuration};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    // enable retry mode - continuously check for new otp codes
     #[arg(long)]
     retry: bool,
 }
 
 fn extract_otp_code(text: &str) -> Option<String> {
-    // common otp patterns
     let patterns = [
-        r"\b\d{6}\b",                    // basic 6 digits
-        r"code\s*:?\s*(\d{6})",          // matches "code: 123456" or "code 123456"
-        r"password\s*:?\s*(\d{6})",      // matches "password: 123456"
-        r"otp\s*:?\s*(\d{6})",          // matches "otp: 123456"
-        r"verification\s*code\s*:?\s*(\d{6})"  // matches "verification code: 123456"
+        r"\b\d{6}\b",                    
+        r"code\s*:?\s*(\d{6})",          
+        r"password\s*:?\s*(\d{6})",      
+        r"otp\s*:?\s*(\d{6})",          
+        r"verification\s*code\s*:?\s*(\d{6})"  
     ];
 
     for pattern in patterns {
         if let Ok(re) = Regex::new(pattern) {
             if let Some(caps) = re.captures(text) {
-                // If the pattern has a capture group, use it; otherwise use the whole match
                 let otp = caps.get(1).map_or_else(
                     || caps.get(0).unwrap().as_str(),
                     |m| m.as_str()
@@ -45,12 +43,10 @@ fn extract_text_from_email(raw_email: &[u8]) -> String {
     let message = Message::parse(raw_email);
     match message {
         Some(msg) => {
-            // try text content first
             if let Some(text) = msg.body_text(0) {
                 return text.to_string();
             }
             
-            // fallback to html content if needed
             if let Some(html) = msg.body_html(0) {
                 let text = html.replace(|c: char| c == '\n' || c == '\r', " ");
                 if let Ok(re) = Regex::new(r"<[^>]*>") {
@@ -65,36 +61,90 @@ fn extract_text_from_email(raw_email: &[u8]) -> String {
 }
 
 fn check_latest_email(imap_session: &mut Session<native_tls::TlsStream<std::net::TcpStream>>) -> Result<Option<String>> {
-    // Get the latest message
-    let messages: Vec<_> = imap_session.search("ALL")?.into_iter().collect();
+    let _mailbox = imap_session.select("INBOX")?;
     
-    if let Some(&last_id) = messages.last() {
-        let sequence = last_id.to_string();
-        let messages = imap_session.fetch(sequence, "RFC822")?;
-        
-        if let Some(message) = messages.iter().next() {
-            if let Some(body) = message.body() {
-                let clean_text = extract_text_from_email(body);
-                return Ok(extract_otp_code(&clean_text));
-            }
+    // Search for all messages, sorted by date (newest first)
+    let uids = imap_session.uid_search("ALL")?;
+    
+    // Get the messages sorted by internal date
+    let sequence = format!("{}:*", uids.iter().min().unwrap_or(&1));
+    let messages = imap_session.fetch(sequence, "(INTERNALDATE RFC822)")?;
+    
+    // Sort messages by internal date
+    let mut messages: Vec<_> = messages.iter().collect();
+    messages.sort_by_key(|m| m.internal_date().unwrap_or_default());
+    messages.reverse(); // newest first
+    
+    // Get the latest message
+    if let Some(message) = messages.first() {
+        if let Some(body) = message.body() {
+            let clean_text = extract_text_from_email(body);
+            return Ok(extract_otp_code(&clean_text));
         }
     }
     
     Ok(None)
 }
 
+fn get_latest_messages(imap_session: &mut Session<native_tls::TlsStream<std::net::TcpStream>>, count: u32) -> Result<Vec<String>> {
+    let _mailbox = imap_session.select("INBOX")?;
+    let mut found_codes = Vec::new();
+    
+    // Get messages from the last 24 hours
+    let date = (Utc::now() - ChronoDuration::days(1)).format("%d-%b-%Y").to_string();
+    let search_criteria = format!("SINCE {}", date);
+    println!("debug: searching with criteria: {}", search_criteria);
+    
+    // Search for recent messages
+    let uids = imap_session.uid_search(&search_criteria)?;
+    println!("debug: found {} recent messages", uids.len());
+    
+    if !uids.is_empty() {
+        // Convert to Vec and sort UIDs in descending order to get latest messages first
+        let mut uid_vec: Vec<_> = uids.into_iter().collect();
+        uid_vec.sort_unstable_by(|a, b| b.cmp(a));
+        
+        // Take only the latest N messages
+        let latest_uids: Vec<_> = uid_vec.iter()
+            .take(count as usize)
+            .map(|&uid| uid.to_string())
+            .collect();
+            
+        let sequence = latest_uids.join(",");
+        println!("debug: fetching messages with sequence: {}", sequence);
+        
+        let fetched = imap_session.uid_fetch(sequence, "(INTERNALDATE RFC822)")?;
+        println!("debug: fetched {} messages", fetched.len());
+        
+        // Sort messages by internal date
+        let mut messages: Vec<_> = fetched.iter().collect();
+        messages.sort_by_key(|m| m.internal_date().unwrap_or_default());
+        messages.reverse(); // newest first
+        
+        for message in messages {
+            if let Some(body) = message.body() {
+                let clean_text = extract_text_from_email(body);
+                if let Some(otp) = extract_otp_code(&clean_text) {
+                    println!("debug: found otp in message: {}", otp);
+                    found_codes.push(otp);
+                }
+            }
+        }
+    }
+    
+    Ok(found_codes)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     dotenv::dotenv().ok();
     
-    // get credentials from env vars
     let email = env::var("EMAIL").expect("EMAIL not set");
     let password = env::var("PASSWORD").expect("PASSWORD not set");
     let domain = env::var("IMAP_SERVER").unwrap_or_else(|_| "imap.mail.yahoo.com".to_string());
 
     println!("debug: connecting to {}", domain);
     
-    // setup tls connector with modern settings
     let tls = TlsConnector::builder()
         .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
         .build()?;
@@ -117,11 +167,7 @@ fn main() -> Result<()> {
         let mut last_id = None;
         
         loop {
-            // refresh inbox view
-            let _mailbox = imap_session.select("INBOX")?;
-            
             if let Ok(Some(otp)) = check_latest_email(&mut imap_session) {
-                // only print new otps
                 if Some(&otp) != last_id.as_ref() {
                     println!("found otp code: {}", otp);
                     last_id = Some(otp);
@@ -131,50 +177,19 @@ fn main() -> Result<()> {
             thread::sleep(Duration::from_secs(3));
         }
     } else {
-        let mailbox = imap_session.select("INBOX")?;
-        println!("debug: total messages in inbox: {}", mailbox.exists);
-        
-        let messages: Vec<_> = imap_session.search("ALL")?.into_iter().collect();
-        let total_messages = messages.len();
-        println!("debug: found {} messages", total_messages);
-        
-        let num_messages_to_fetch = 10.min(total_messages);
-        if num_messages_to_fetch > 0 {
-            let latest_messages: Vec<_> = messages.into_iter()
-                .rev()
-                .take(num_messages_to_fetch)
-                .collect();
-                
-            println!("debug: fetching latest {} messages", num_messages_to_fetch);
-            
-            let sequence = latest_messages
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-                
-            let fetched_messages = imap_session.fetch(sequence, "RFC822")?;
-            let mut found_codes = Vec::new();
-            
-            for message in fetched_messages.iter() {
-                if let Some(body) = message.body() {
-                    let clean_text = extract_text_from_email(body);
-                    if let Some(otp) = extract_otp_code(&clean_text) {
-                        found_codes.push(otp);
-                    }
+        println!("debug: fetching latest 10 messages...");
+        match get_latest_messages(&mut imap_session, 10) {
+            Ok(found_codes) => {
+                println!("\ndebug: found {} otp codes in the latest 10 emails:", found_codes.len());
+                for (i, code) in found_codes.iter().enumerate() {
+                    println!("{}. {}", i + 1, code);
                 }
-            }
-            
-            println!("\ndebug: found {} otp codes in the latest {} emails:", found_codes.len(), num_messages_to_fetch);
-            for (i, code) in found_codes.iter().enumerate() {
-                println!("{}. {}", i + 1, code);
-            }
-            
-            if found_codes.is_empty() {
-                println!("no otp codes found in any of the messages");
-            }
-        } else {
-            println!("no messages found in mailbox");
+                
+                if found_codes.is_empty() {
+                    println!("no otp codes found in any of the messages");
+                }
+            },
+            Err(e) => println!("error fetching messages: {:?}", e),
         }
         
         println!("debug: logging out");
