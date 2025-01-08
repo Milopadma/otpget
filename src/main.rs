@@ -1,4 +1,3 @@
-use std::env;
 use std::thread;
 use std::time::Duration;
 use native_tls::TlsConnector;
@@ -10,8 +9,22 @@ use imap::Session;
 use chrono::{Utc, Duration as ChronoDuration};
 use dialoguer::{Input, Password, theme::ColorfulTheme};
 use keyring::Entry;
+use serde::{Serialize, Deserialize};
+use indicatif::{ProgressBar, ProgressStyle};
+use once_cell::sync::OnceCell;
 
-const SERVICE_NAME: &str = "otpget";
+// Use a more specific service name and username that represents the application identity
+const SERVICE_NAME: &str = "com.otpget.app";
+const USERNAME: &str = "otpget-main-credentials";
+
+static KEYCHAIN_ENTRY: OnceCell<Entry> = OnceCell::new();
+
+#[derive(Serialize, Deserialize)]
+struct Credentials {
+    email: String,
+    password: String,
+    imap_server: String,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -26,19 +39,28 @@ struct Args {
     setup: bool,
 }
 
+fn get_keychain_entry() -> Result<Entry> {
+    Ok(Entry::new(SERVICE_NAME, USERNAME)?)
+}
+
 fn get_credentials() -> Result<(String, String, String)> {
-    let email_entry = Entry::new(SERVICE_NAME, "email")?;
-    let password_entry = Entry::new(SERVICE_NAME, "password")?;
-    let imap_entry = Entry::new(SERVICE_NAME, "imap_server")?;
-
-    let email = email_entry.get_password()
-        .map_err(|_| anyhow!("Email not found. Run with --setup flag to configure."))?;
-    let password = password_entry.get_password()
-        .map_err(|_| anyhow!("Password not found. Run with --setup flag to configure."))?;
-    let imap_server = imap_entry.get_password()
-        .unwrap_or_else(|_| "imap.mail.yahoo.com".to_string());
-
-    Ok((email, password, imap_server))
+    let entry = get_keychain_entry()?;
+    println!("attempting to retrieve password from keyring");
+    
+    let creds_str = entry.get_password()
+        .map_err(|e| {
+            println!("DEBUG: Failed to get password: {:?}", e);
+            anyhow!("Credentials not found. Run with --setup flag to configure.")
+        })?;
+    
+    println!("successfully retrieved password, attempting to parse");
+    let creds: Credentials = serde_json::from_str(&creds_str)
+        .map_err(|e| {
+            println!("DEBUG: Failed to parse credentials: {:?}", e);
+            anyhow!("Failed to parse credentials. Run with --setup flag to reconfigure.")
+        })?;
+    
+    Ok((creds.email, creds.password, creds.imap_server))
 }
 
 fn setup_config() -> Result<()> {
@@ -60,17 +82,32 @@ fn setup_config() -> Result<()> {
         .default("imap.gmail.com".into())
         .interact()?;
 
-    // Store credentials in system keyring
-    let email_entry = Entry::new(SERVICE_NAME, "email")?;
-    let password_entry = Entry::new(SERVICE_NAME, "password")?;
-    let imap_entry = Entry::new(SERVICE_NAME, "imap_server")?;
+    let creds = Credentials {
+        email,
+        password,
+        imap_server,
+    };
 
-    email_entry.set_password(&email)?;
-    password_entry.set_password(&password)?;
-    imap_entry.set_password(&imap_server)?;
+    println!("DEBUG: Serializing credentials");
+    let creds_str = serde_json::to_string(&creds)
+        .map_err(|e| {
+            println!("DEBUG: Failed to serialize credentials: {:?}", e);
+            anyhow!("Failed to serialize credentials")
+        })?;
+
+    println!("DEBUG: Creating new keyring entry");
+    let entry = Entry::new(SERVICE_NAME, USERNAME)?;
+    
+    println!("DEBUG: Setting password in keyring");
+    entry.set_password(&creds_str)
+        .map_err(|e| {
+            println!("DEBUG: Failed to set password: {:?}", e);
+            anyhow!("Failed to save credentials: {}", e)
+        })?;
 
     println!("\nConfiguration saved securely!");
     println!("You can now run otpget without the --setup flag.");
+    println!("Note: You may want to click 'Always Allow' in the keychain prompt to avoid future prompts.");
 
     Ok(())
 }
@@ -129,32 +166,53 @@ fn extract_text_from_email(raw_email: &[u8]) -> String {
 }
 
 fn check_latest_email(imap_session: &mut Session<native_tls::TlsStream<std::net::TcpStream>>) -> Result<Option<String>> {
-    let _mailbox = imap_session.select("INBOX")?;
-    
-    // Search for all messages, sorted by date (newest first)
-    let uids = imap_session.uid_search("ALL")?;
-    
-    // Get the messages sorted by internal date
-    let sequence = format!("{}:*", uids.iter().min().unwrap_or(&1));
-    let messages = imap_session.fetch(sequence, "(INTERNALDATE RFC822)")?;
-    
-    // Sort messages by internal date
-    let mut messages: Vec<_> = messages.iter().collect();
-    messages.sort_by_key(|m| m.internal_date().unwrap_or_default());
-    messages.reverse(); // newest first
-    
-    // Get the latest message
-    if let Some(message) = messages.first() {
-        if let Some(body) = message.body() {
-            let clean_text = extract_text_from_email(body);
-            return Ok(extract_otp_code(&clean_text));
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            .template("{spinner} Checking for new OTP codes...").unwrap()
+    );
+    spinner.enable_steady_tick(Duration::from_millis(120));
+
+    let result = {
+        let _mailbox = imap_session.select("INBOX")?;
+        
+        // Search for all messages, sorted by date (newest first)
+        let uids = imap_session.uid_search("ALL")?;
+        
+        // Get the messages sorted by internal date
+        let sequence = format!("{}:*", uids.iter().min().unwrap_or(&1));
+        let messages = imap_session.fetch(sequence, "(INTERNALDATE RFC822)")?;
+        
+        // Sort messages by internal date
+        let mut messages: Vec<_> = messages.iter().collect();
+        messages.sort_by_key(|m| m.internal_date().unwrap_or_default());
+        messages.reverse(); // newest first
+        
+        // Get the latest message
+        if let Some(message) = messages.first() {
+            if let Some(body) = message.body() {
+                let clean_text = extract_text_from_email(body);
+                return Ok(extract_otp_code(&clean_text));
+            }
         }
-    }
-    
-    Ok(None)
+        
+        Ok(None)
+    };
+
+    spinner.finish_and_clear();
+    result
 }
 
 fn get_latest_messages(imap_session: &mut Session<native_tls::TlsStream<std::net::TcpStream>>, count: u32) -> Result<Vec<String>> {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            .template("{spinner} searching for OTP codes...").unwrap()
+    );
+    spinner.enable_steady_tick(Duration::from_millis(120));
+
     let _mailbox = imap_session.select("INBOX")?;
     let mut found_codes = Vec::new();
     
@@ -200,6 +258,7 @@ fn get_latest_messages(imap_session: &mut Session<native_tls::TlsStream<std::net
         }
     }
     
+    spinner.finish_and_clear();
     Ok(found_codes)
 }
 
