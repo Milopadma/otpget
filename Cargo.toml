@@ -17,3 +17,5 @@ mail-parser = "0.8"
 regex = "1.10"
 clap = { version = "4.4", features = ["derive"] }
 chrono = "0.4"
+dialoguer = "0.11.0"
+keyring = "2.3.2"

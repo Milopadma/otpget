@@ -2,12 +2,16 @@ use std::env;
 use std::thread;
 use std::time::Duration;
 use native_tls::TlsConnector;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use mail_parser::Message;
 use regex::Regex;
 use clap::Parser;
 use imap::Session;
 use chrono::{Utc, Duration as ChronoDuration};
+use dialoguer::{Input, Password, theme::ColorfulTheme};
+use keyring::Entry;
+
+const SERVICE_NAME: &str = "otpget";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -17,6 +21,58 @@ struct Args {
 
     #[arg(long)]
     debug: bool,
+
+    #[arg(long)]
+    setup: bool,
+}
+
+fn get_credentials() -> Result<(String, String, String)> {
+    let email_entry = Entry::new(SERVICE_NAME, "email")?;
+    let password_entry = Entry::new(SERVICE_NAME, "password")?;
+    let imap_entry = Entry::new(SERVICE_NAME, "imap_server")?;
+
+    let email = email_entry.get_password()
+        .map_err(|_| anyhow!("Email not found. Run with --setup flag to configure."))?;
+    let password = password_entry.get_password()
+        .map_err(|_| anyhow!("Password not found. Run with --setup flag to configure."))?;
+    let imap_server = imap_entry.get_password()
+        .unwrap_or_else(|_| "imap.mail.yahoo.com".to_string());
+
+    Ok((email, password, imap_server))
+}
+
+fn setup_config() -> Result<()> {
+    println!("Welcome to OTPGet Setup!");
+    println!("This wizard will help you configure your email settings.\n");
+
+    let theme = ColorfulTheme::default();
+
+    let email: String = Input::with_theme(&theme)
+        .with_prompt("Enter your email address")
+        .interact()?;
+
+    let password: String = Password::with_theme(&theme)
+        .with_prompt("Enter your email password")
+        .interact()?;
+
+    let imap_server: String = Input::with_theme(&theme)
+        .with_prompt("Enter your IMAP server (e.g., imap.gmail.com)")
+        .default("imap.gmail.com".into())
+        .interact()?;
+
+    // Store credentials in system keyring
+    let email_entry = Entry::new(SERVICE_NAME, "email")?;
+    let password_entry = Entry::new(SERVICE_NAME, "password")?;
+    let imap_entry = Entry::new(SERVICE_NAME, "imap_server")?;
+
+    email_entry.set_password(&email)?;
+    password_entry.set_password(&password)?;
+    imap_entry.set_password(&imap_server)?;
+
+    println!("\nConfiguration saved securely!");
+    println!("You can now run otpget without the --setup flag.");
+
+    Ok(())
 }
 
 // debug logging macro
@@ -149,11 +205,12 @@ fn get_latest_messages(imap_session: &mut Session<native_tls::TlsStream<std::net
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    dotenv::dotenv().ok();
     
-    let email = env::var("EMAIL").expect("EMAIL not set");
-    let password = env::var("PASSWORD").expect("PASSWORD not set");
-    let domain = env::var("IMAP_SERVER").unwrap_or_else(|_| "imap.mail.yahoo.com".to_string());
+    if args.setup {
+        return setup_config();
+    }
+
+    let (email, password, domain) = get_credentials()?;
 
     debug!("connecting to {}", domain);
     
