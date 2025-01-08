@@ -2,6 +2,11 @@
 name = "otpget"
 version = "0.1.0"
 edition = "2021"
+description = "A command-line tool for automatically retrieving OTP codes from email messages"
+license = "MIT"
+repository = "https://github.com/milopadma/otpget"
+documentation = "https://github.com/milopadma/otpget#readme"
+homepage = "https://github.com/milopadma/otpget"
 
 [dependencies]
 imap = "2.4.1"
