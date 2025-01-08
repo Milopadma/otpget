@@ -19,7 +19,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 1. Place the `otpget` binary in a directory of your choice
 2. Run the setup wizard:
 ```bash
-./otpget --setup
+$ otpget --setup
 ```
 3. Enter your email credentials and IMAP server.
 4. You can now run `otpget` without the `--setup` flag.
@@ -29,13 +29,13 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ### Single Check
 To check the latest emails once for OTP codes:
 ```bash
-./otpget
+$ otpget
 ```
 
 ### Continuous Monitoring
 To continuously monitor for new OTP codes (checks every 3 seconds):
 ```bash
-./otpget --retry
+$ otpget --retry
 ```
 Press Ctrl+C to stop monitoring.
 
