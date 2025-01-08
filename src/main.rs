@@ -14,6 +14,18 @@ use chrono::{Utc, Duration as ChronoDuration};
 struct Args {
     #[arg(long)]
     retry: bool,
+
+    #[arg(long)]
+    debug: bool,
+}
+
+// debug logging macro
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        if std::env::args().any(|arg| arg == "--debug") {
+            println!("debug: {}", format!($($arg)*));
+        }
+    };
 }
 
 fn extract_otp_code(text: &str) -> Option<String> {
@@ -93,11 +105,11 @@ fn get_latest_messages(imap_session: &mut Session<native_tls::TlsStream<std::net
     // Get messages from the last 24 hours
     let date = (Utc::now() - ChronoDuration::days(1)).format("%d-%b-%Y").to_string();
     let search_criteria = format!("SINCE {}", date);
-    println!("debug: searching with criteria: {}", search_criteria);
+    debug!("searching with criteria: {}", search_criteria);
     
     // Search for recent messages
     let uids = imap_session.uid_search(&search_criteria)?;
-    println!("debug: found {} recent messages", uids.len());
+    debug!("found {} recent messages", uids.len());
     
     if !uids.is_empty() {
         // Convert to Vec and sort UIDs in descending order to get latest messages first
@@ -111,10 +123,10 @@ fn get_latest_messages(imap_session: &mut Session<native_tls::TlsStream<std::net
             .collect();
             
         let sequence = latest_uids.join(",");
-        println!("debug: fetching messages with sequence: {}", sequence);
+        debug!("fetching messages with sequence: {}", sequence);
         
         let fetched = imap_session.uid_fetch(sequence, "(INTERNALDATE RFC822)")?;
-        println!("debug: fetched {} messages", fetched.len());
+        debug!("fetched {} messages", fetched.len());
         
         // Sort messages by internal date
         let mut messages: Vec<_> = fetched.iter().collect();
@@ -125,7 +137,7 @@ fn get_latest_messages(imap_session: &mut Session<native_tls::TlsStream<std::net
             if let Some(body) = message.body() {
                 let clean_text = extract_text_from_email(body);
                 if let Some(otp) = extract_otp_code(&clean_text) {
-                    println!("debug: found otp in message: {}", otp);
+                    debug!("found otp in message: {}", otp);
                     found_codes.push(otp);
                 }
             }
@@ -143,7 +155,7 @@ fn main() -> Result<()> {
     let password = env::var("PASSWORD").expect("PASSWORD not set");
     let domain = env::var("IMAP_SERVER").unwrap_or_else(|_| "imap.mail.yahoo.com".to_string());
 
-    println!("debug: connecting to {}", domain);
+    debug!("connecting to {}", domain);
     
     let tls = TlsConnector::builder()
         .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
@@ -151,18 +163,18 @@ fn main() -> Result<()> {
     
     let client = imap::connect((domain.as_str(), 993), domain.as_str(), &tls)?;
     
-    println!("debug: attempting login for {}", email);
+    debug!("attempting login for {}", email);
     
     let mut imap_session = client.login(&email, &password)
         .map_err(|e| {
-            println!("debug: authentication error: {:?}", e);
+            debug!("authentication error: {:?}", e);
             e.0
         })?;
 
-    println!("debug: successfully logged in");
+    debug!("successfully logged in");
 
     if args.retry {
-        println!("debug: retry mode enabled - checking for new otp codes every 3 seconds...");
+        debug!("retry mode enabled - checking for new otp codes every 3 seconds...");
         println!("press ctrl+c to stop");
         let mut last_id = None;
         
@@ -177,10 +189,11 @@ fn main() -> Result<()> {
             thread::sleep(Duration::from_secs(3));
         }
     } else {
-        println!("debug: fetching latest 10 messages...");
+        debug!("fetching latest 10 messages...");
         match get_latest_messages(&mut imap_session, 10) {
             Ok(found_codes) => {
-                println!("\ndebug: found {} otp codes in the latest 10 emails:", found_codes.len());
+                debug!("found {} otp codes in the latest 10 emails:", found_codes.len());
+                println!("found otp codes:");
                 for (i, code) in found_codes.iter().enumerate() {
                     println!("{}. {}", i + 1, code);
                 }
@@ -192,7 +205,7 @@ fn main() -> Result<()> {
             Err(e) => println!("error fetching messages: {:?}", e),
         }
         
-        println!("debug: logging out");
+        debug!("logging out");
         imap_session.logout()?;
     }
     
