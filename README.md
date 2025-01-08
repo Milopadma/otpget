@@ -17,12 +17,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ### Manual Setup
 1. Place the `otpget` binary in a directory of your choice
-2. Create a `.env` file in the same directory with your email credentials:
-```env
-EMAIL=your_email@example.com
-PASSWORD=your_email_app_password (not the same as your email password, think api key)
-IMAP_SERVER=your.imap.server  # optional, defaults to imap.mail.yahoo.com
+2. Run the setup wizard:
+```bash
+./otpget --setup
 ```
+3. Enter your email credentials and IMAP server.
+4. You can now run `otpget` without the `--setup` flag.
 
 ## Usage
 
